@@ -51,12 +51,23 @@ curl -X POST http://<server>:8484/api/state -d '{"anim":"sakura","speed":4,"brig
 curl http://<server>:8484/api/status
 ```
 
-### Custom image
-The **// CUSTOM** section of the portal accepts any PNG/JPG. The browser
-cover-crops it to 320x240 and the server stores it as native RGB565
-(`portal/image.bin`); the display streams it directly to the panel when the
-"Custom Image" preset is active. Scripts can POST raw RGB888 bytes
-(320*240*3) to `/api/image`.
+### Custom media (images + GIFs)
+The **// CUSTOM MEDIA** section of the portal accepts PNG/JPG **and animated
+GIFs**, and keeps everything you upload as a library with thumbnails — click
+any saved item to put it on the display, ✕ to delete it.
+
+- Stills are cover-cropped to 320x240 in the browser and streamed straight
+  to the panel.
+- GIFs are decoded in the browser (Chrome/Edge), downsampled to up to 20
+  frames at 160x120, and stored server-side. The display downloads the pack
+  **once** into its onboard flash filesystem, then loops it locally at the
+  GIF's own frame rate with 2x pixel doubling — no network traffic during
+  playback.
+
+Everything lives in `portal/media/` in a simple device-native format
+(`NX01` header + RGB565 frames); `/api/media` lists it, `/api/media/select`
+and `/api/media/delete` manage it, and the device fetches the current
+selection from `/api/image.bin`.
 
 ## Deploying the portal on a server (auto-sync with GitHub)
 

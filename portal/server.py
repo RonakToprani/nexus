@@ -20,10 +20,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(HERE, "state.json")
-IMAGE_FILE = os.path.join(HERE, "image.bin")   # 320x240 RGB565 little-endian
+MEDIA_DIR = os.path.join(HERE, "media")        # saved images / GIF packs
+MEDIA_META = os.path.join(HERE, "media.json")
+LEGACY_IMAGE = os.path.join(HERE, "image.bin") # pre-library single image
 
-IMG_W, IMG_H = 320, 240
-IMG_RGB_LEN = IMG_W * IMG_H * 3
+# Device media format ("NX01", 12-byte header, then RGB565-LE frames):
+#   magic[4] kind:u8 (0 still, 1 gif) frames:u8 delay_ms:u16 w:u16 h:u16
+# still: 1 frame 320x240; gif: up to 20 frames 160x120
+MAGIC = b"NX01"
+HDR = 12
+MAX_MEDIA_BYTES = HDR + 24 * 160 * 120 * 2
 
 ANIMATIONS = [
     {"id": "matrix", "name": "Digital Rain",   "desc": "Katakana code cascade",        "color": "#00ff9c"},
@@ -47,8 +53,9 @@ ANIMATIONS = [
 ANIM_IDS = {a["id"] for a in ANIMATIONS}
 
 _lock = threading.Lock()
-_state = {"anim": "hud", "speed": 5, "brightness": 90, "rev": 1, "img_rev": 0}
+_state = {"anim": "hud", "speed": 5, "brightness": 90, "rev": 1, "img_rev": 0, "img": None}
 _device = {"last_seen": 0.0, "ip": None}
+_media = {"next_id": 1, "items": []}   # items: [{id, name, kind, frames, w, h}]
 
 
 def load_state():
@@ -58,9 +65,10 @@ def load_state():
             saved = json.load(f)
         if saved.get("anim") in ANIM_IDS:
             _state.update({k: saved[k] for k in
-                           ("anim", "speed", "brightness", "rev", "img_rev") if k in saved})
+                           ("anim", "speed", "brightness", "rev", "img_rev", "img") if k in saved})
     except (OSError, ValueError):
         pass
+    load_media()
 
 
 def save_state():
@@ -69,6 +77,44 @@ def save_state():
             json.dump(_state, f)
     except OSError:
         pass
+
+
+def media_path(mid):
+    return os.path.join(MEDIA_DIR, f"{int(mid)}.bin")
+
+
+def save_media():
+    with open(MEDIA_META, "w") as f:
+        json.dump(_media, f)
+
+
+def load_media():
+    global _media
+    os.makedirs(MEDIA_DIR, exist_ok=True)
+    try:
+        with open(MEDIA_META) as f:
+            _media = json.load(f)
+    except (OSError, ValueError):
+        pass
+    # import the pre-library single image, if one was uploaded
+    if not _media["items"] and os.path.exists(LEGACY_IMAGE):
+        try:
+            with open(LEGACY_IMAGE, "rb") as f:
+                pixels = f.read()
+            if len(pixels) == 320 * 240 * 2:
+                hdr = MAGIC + bytes([0, 1]) + (0).to_bytes(2, "little") \
+                    + (320).to_bytes(2, "little") + (240).to_bytes(2, "little")
+                mid = _media["next_id"]
+                with open(media_path(mid), "wb") as f:
+                    f.write(hdr + pixels)
+                _media["items"].append({"id": mid, "name": "imported", "kind": 0,
+                                        "frames": 1, "w": 320, "h": 240})
+                _media["next_id"] = mid + 1
+                _state["img"] = mid
+                save_media()
+            os.remove(LEGACY_IMAGE)
+        except OSError:
+            pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,12 +145,24 @@ class Handler(BaseHTTPRequestHandler):
                     _device["ip"] = self.client_address[0]
             with _lock:
                 self._send(200, json.dumps(_state))
-        elif path == "/api/image.bin":
+        elif path == "/api/image.bin":       # device: currently selected media
+            with _lock:
+                mid = _state["img"]
             try:
-                with open(IMAGE_FILE, "rb") as f:
+                with open(media_path(mid), "rb") as f:
                     self._send(200, f.read(), "application/octet-stream")
-            except OSError:
-                self._send(404, '{"error":"no image uploaded"}')
+            except (OSError, TypeError):
+                self._send(404, '{"error":"no media selected"}')
+        elif path == "/api/media":
+            with _lock:
+                self._send(200, json.dumps({"items": _media["items"], "current": _state["img"]}))
+        elif path.startswith("/api/media/") and path.endswith(".bin"):
+            try:
+                mid = int(path[len("/api/media/"):-4])
+                with open(media_path(mid), "rb") as f:
+                    self._send(200, f.read(), "application/octet-stream")
+            except (ValueError, OSError):
+                self._send(404, '{"error":"not found"}')
         elif path == "/api/status":
             with _lock:
                 age = time.time() - _device["last_seen"]
@@ -121,8 +179,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path == "/api/image":
-            self._recv_image()
+        if path == "/api/media":
+            self._recv_media()
+            return
+        if path in ("/api/media/select", "/api/media/delete"):
+            self._media_op(path.endswith("delete"))
             return
         if path != "/api/state":
             self._send(404, '{"error":"not found"}')
@@ -151,11 +212,12 @@ class Handler(BaseHTTPRequestHandler):
                 save_state()
             self._send(200, json.dumps(_state))
 
-    def _recv_image(self):
-        # body: raw RGB888, 320x240, row-major (browser canvas does the resize)
+    def _recv_media(self):
+        # body: complete device-format binary, built by the browser (see MAGIC)
+        from urllib.parse import parse_qs, urlparse, unquote
         length = int(self.headers.get("Content-Length", 0))
-        if length != IMG_RGB_LEN:
-            self._send(400, json.dumps({"error": f"expected {IMG_RGB_LEN} bytes, got {length}"}))
+        if not HDR < length <= MAX_MEDIA_BYTES:
+            self._send(400, json.dumps({"error": f"bad size {length}"}))
             return
         raw = b""
         while len(raw) < length:
@@ -164,18 +226,63 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, '{"error":"truncated body"}')
                 return
             raw += chunk
-        out = bytearray(IMG_W * IMG_H * 2)
-        j = 0
-        for i in range(0, IMG_RGB_LEN, 3):
-            v = ((raw[i] & 0xF8) << 8) | ((raw[i + 1] & 0xFC) << 3) | (raw[i + 2] >> 3)
-            out[j] = v & 0xFF          # little-endian, the ESP32's native order
-            out[j + 1] = v >> 8
-            j += 2
-        with open(IMAGE_FILE, "wb") as f:
-            f.write(out)
+        if raw[:4] != MAGIC:
+            self._send(400, '{"error":"bad magic"}')
+            return
+        kind, frames = raw[4], raw[5]
+        w = int.from_bytes(raw[8:10], "little")
+        h = int.from_bytes(raw[10:12], "little")
+        if frames < 1 or len(raw) != HDR + frames * w * h * 2 \
+           or (kind == 0 and (w, h, frames) != (320, 240, 1)) \
+           or (kind == 1 and (w, h) != (160, 120)):
+            self._send(400, '{"error":"header/body mismatch"}')
+            return
+        q = parse_qs(urlparse(self.path).query)
+        name = unquote(q.get("name", ["untitled"])[0])[:40]
+        name = "".join(c for c in name if c.isprintable() and c not in "<>&\"'") or "untitled"
         with _lock:
+            mid = _media["next_id"]
+            _media["next_id"] = mid + 1
+            with open(media_path(mid), "wb") as f:
+                f.write(raw)
+            _media["items"].append({"id": mid, "name": name, "kind": kind,
+                                    "frames": frames, "w": w, "h": h})
+            save_media()
+            _state["img"] = mid
+            _state["anim"] = "custom"
             _state["img_rev"] += 1
             _state["rev"] += 1
+            save_state()
+            self._send(200, json.dumps(_state))
+
+    def _media_op(self, is_delete):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            mid = int(body["id"])
+        except (ValueError, KeyError):
+            self._send(400, '{"error":"bad json"}')
+            return
+        with _lock:
+            if not any(it["id"] == mid for it in _media["items"]):
+                self._send(404, '{"error":"no such media"}')
+                return
+            if is_delete:
+                _media["items"] = [it for it in _media["items"] if it["id"] != mid]
+                save_media()
+                try:
+                    os.remove(media_path(mid))
+                except OSError:
+                    pass
+                if _state["img"] == mid:
+                    _state["img"] = _media["items"][-1]["id"] if _media["items"] else None
+                    _state["img_rev"] += 1
+                    _state["rev"] += 1
+            else:  # select
+                _state["img"] = mid
+                _state["anim"] = "custom"
+                _state["img_rev"] += 1
+                _state["rev"] += 1
             save_state()
             self._send(200, json.dumps(_state))
 
@@ -344,23 +451,15 @@ PAGE = r"""<!doctype html>
   <div class="grid" id="grid"></div>
   <div class="sect">// CHILL ZONE</div>
   <div class="grid" id="grid2"></div>
-  <div class="sect">// CUSTOM</div>
-  <div class="grid">
-    <button class="card" id="customCard" style="--c:#ffffff">
-      <div class="prev" style="display:flex;align-items:center;justify-content:center">
-        <canvas id="thumb" width="320" height="240"
-                style="max-width:100%;max-height:100%;display:none"></canvas>
-        <span id="noimg" style="font-size:10px;color:var(--dim);letter-spacing:.15em">NO IMAGE YET</span>
-      </div>
-      <div class="nm">Custom Image</div><div class="ds">Show your uploaded picture</div>
-    </button>
+  <div class="sect">// CUSTOM MEDIA</div>
+  <div class="grid" id="mediaGrid">
     <button class="card" id="uploadCard" style="--c:#00e5ff">
       <div class="prev" style="display:flex;align-items:center;justify-content:center;
            font-size:26px;color:var(--cyan)">&#8686;</div>
-      <div class="nm">Upload Picture</div><div class="ds" id="upStatus">PNG / JPG, fitted to 320x240</div>
+      <div class="nm">Upload</div><div class="ds" id="upStatus">PNG / JPG / GIF</div>
     </button>
   </div>
-  <input type="file" id="file" accept="image/*" hidden>
+  <input type="file" id="file" accept="image/*,.gif" hidden>
   <div class="panel">
     <h2>PARAMETERS</h2>
     <div class="slider-row">
@@ -392,8 +491,8 @@ function render() {
     b.onclick = () => post({anim: a.id});
     (a.group === 'chill' ? grid2 : grid).appendChild(b);
   }
-  document.getElementById('customCard').className =
-    'card' + (state.anim === 'custom' ? ' active' : '');
+  for (const c of document.querySelectorAll('#mediaGrid .card[data-id]'))
+    c.classList.toggle('active', state.anim === 'custom' && state.img === +c.dataset.id);
   document.getElementById('speed').value = state.speed;
   document.getElementById('speedv').textContent = state.speed;
   document.getElementById('bright').value = state.brightness;
@@ -432,28 +531,98 @@ document.getElementById('bright').oninput = e => {
   debouncedPost({brightness: +e.target.value});
 };
 
-// ---- custom image upload / thumbnail ----
-const thumb = document.getElementById('thumb'), noimg = document.getElementById('noimg');
-document.getElementById('customCard').onclick = () => post({anim: 'custom'});
+// ---- custom media library (stills + GIFs) ----
 document.getElementById('uploadCard').onclick = () => document.getElementById('file').click();
 
-async function loadThumb() {   // decode the stored RGB565 back into the preview
-  try {
-    const r = await fetch('/api/image.bin');
-    if (!r.ok) return;
-    const dv = new DataView(await r.arrayBuffer());
-    const ctx = thumb.getContext('2d');
-    const id = ctx.createImageData(320, 240);
-    for (let p = 0; p < 320 * 240; p++) {
-      const v = dv.getUint16(p * 2, true);
-      id.data[p*4]   = (v >> 8) & 0xF8;
-      id.data[p*4+1] = (v >> 3) & 0xFC;
-      id.data[p*4+2] = (v << 3) & 0xF8;
-      id.data[p*4+3] = 255;
-    }
-    ctx.putImageData(id, 0, 0);
-    thumb.style.display = 'block'; noimg.style.display = 'none';
-  } catch (e) {}
+function coverDraw(ctx, src, W, H) {
+  const s = Math.max(W / src.width, H / src.height);
+  ctx.drawImage(src, (W - src.width*s)/2, (H - src.height*s)/2, src.width*s, src.height*s);
+}
+
+function pack565(data, out, off) {   // RGBA -> RGB565 little-endian
+  for (let i = 0, j = off; i < data.length; i += 4) {
+    const v = ((data[i] & 0xF8) << 8) | ((data[i+1] & 0xFC) << 3) | (data[i+2] >> 3);
+    out[j++] = v & 0xFF; out[j++] = v >> 8;
+  }
+}
+
+function unpack565(dv, off, W, H, ctx) {
+  const id = ctx.createImageData(W, H);
+  for (let p = 0; p < W * H; p++) {
+    const v = dv.getUint16(off + p * 2, true);
+    id.data[p*4] = (v >> 8) & 0xF8; id.data[p*4+1] = (v >> 3) & 0xFC;
+    id.data[p*4+2] = (v << 3) & 0xF8; id.data[p*4+3] = 255;
+  }
+  ctx.putImageData(id, 0, 0);
+}
+
+async function refreshMedia() {
+  const r = await fetch('/api/media');
+  const m = await r.json();
+  const g = document.getElementById('mediaGrid');
+  for (const c of g.querySelectorAll('.card[data-id]')) c.remove();
+  for (const it of m.items) {
+    const b = document.createElement('button');
+    b.className = 'card';
+    b.dataset.id = it.id;
+    b.style.setProperty('--c', it.kind ? '#ff4fd8' : '#ffffff');
+    b.innerHTML = `<div class="prev" style="display:flex;align-items:center;justify-content:center">
+        <canvas width="${it.w}" height="${it.h}" style="max-width:100%;max-height:100%"></canvas></div>
+      <div class="nm"></div>
+      <div class="ds">${it.kind ? it.frames + ' frames // GIF' : 'still image'}
+        <span style="color:#ff5c5c;float:right;cursor:pointer" data-del="${it.id}">&#10005;</span></div>`;
+    b.querySelector('.nm').textContent = it.name;
+    b.onclick = async ev => {
+      if (ev.target.dataset.del) {
+        await fetch('/api/media/delete', {method: 'POST', body: JSON.stringify({id: it.id})});
+        refreshMedia();
+      } else {
+        state = await (await fetch('/api/media/select',
+          {method: 'POST', body: JSON.stringify({id: it.id})})).json();
+        render();
+      }
+    };
+    g.appendChild(b);
+    fetch(`/api/media/${it.id}.bin`).then(async res => {   // thumbnail = first frame
+      if (!res.ok) return;
+      const dv = new DataView(await res.arrayBuffer());
+      unpack565(dv, 12, it.w, it.h, b.querySelector('canvas').getContext('2d'));
+    });
+  }
+  render();
+}
+
+async function buildStill(f) {
+  let img;
+  try { img = await createImageBitmap(f); }
+  catch (_) { throw new Error('browser cannot decode this format (HEIC?) - use PNG/JPG/GIF'); }
+  const c = new OffscreenCanvas(320, 240), x = c.getContext('2d');
+  coverDraw(x, img, 320, 240);
+  const out = new Uint8Array(12 + 320 * 240 * 2);
+  out.set([0x4E, 0x58, 0x30, 0x31, 0, 1, 0, 0, 320 & 255, 320 >> 8, 240, 0]);
+  pack565(x.getImageData(0, 0, 320, 240).data, out, 12);
+  return out;
+}
+
+async function buildGif(f) {
+  if (!('ImageDecoder' in window)) throw new Error('GIF decoding needs Chrome/Edge');
+  const dec = new ImageDecoder({data: await f.arrayBuffer(), type: 'image/gif'});
+  await dec.tracks.ready; await dec.completed;
+  const total = dec.tracks.selectedTrack.frameCount;
+  const MAXF = 20, n = Math.min(total, MAXF);
+  const c = new OffscreenCanvas(160, 120), x = c.getContext('2d');
+  const out = new Uint8Array(12 + n * 160 * 120 * 2);
+  let delay = 100;
+  for (let k = 0; k < n; k++) {
+    const idx = total <= MAXF ? k : Math.floor(k * total / n);   // sample long GIFs
+    const {image} = await dec.decode({frameIndex: idx});
+    if (k === 0 && image.duration) delay = Math.min(500, Math.max(30, image.duration / 1000));
+    coverDraw(x, image, 160, 120);
+    image.close();
+    pack565(x.getImageData(0, 0, 160, 120).data, out, 12 + k * 160 * 120 * 2);
+  }
+  out.set([0x4E, 0x58, 0x30, 0x31, 1, n, delay & 255, delay >> 8, 160, 0, 120, 0]);
+  return out;
 }
 
 document.getElementById('file').onchange = async e => {
@@ -462,36 +631,21 @@ document.getElementById('file').onchange = async e => {
   const st = document.getElementById('upStatus');
   st.textContent = 'PROCESSING...';
   try {
-    let img;
-    try {
-      img = await createImageBitmap(f);
-    } catch (_) {
-      throw new Error('browser cannot decode this format (HEIC?) - use PNG or JPG');
-    }
-    const c = document.createElement('canvas');
-    c.width = 320; c.height = 240;
-    const x = c.getContext('2d');
-    const s = Math.max(320 / img.width, 240 / img.height);   // cover-crop
-    x.drawImage(img, (320 - img.width*s)/2, (240 - img.height*s)/2, img.width*s, img.height*s);
-    const d = x.getImageData(0, 0, 320, 240).data;
-    const rgb = new Uint8Array(320 * 240 * 3);
-    for (let i = 0, j = 0; i < d.length; i += 4) {
-      rgb[j++] = d[i]; rgb[j++] = d[i+1]; rgb[j++] = d[i+2];
-    }
+    const bin = f.type === 'image/gif' ? await buildGif(f) : await buildStill(f);
     st.textContent = 'UPLOADING...';
-    const r = await fetch('/api/image', {method: 'POST', body: rgb});
+    const name = encodeURIComponent(f.name.replace(/\.[^.]+$/, ''));
+    const r = await fetch('/api/media?name=' + name, {method: 'POST', body: bin});
     if (!r.ok) throw new Error(await r.text());
-    thumb.getContext('2d').drawImage(c, 0, 0);
-    thumb.style.display = 'block'; noimg.style.display = 'none';
+    state = await r.json();
     st.textContent = 'SENT // DISPLAY UPDATING';
-    await post({anim: 'custom'});
+    refreshMedia();
   } catch (err) {
-    st.textContent = 'UPLOAD FAILED: ' + err.message;
+    st.textContent = 'FAILED: ' + err.message;
   }
   e.target.value = '';
 };
 
-poll(); setInterval(poll, 3000); loadThumb();
+poll(); setInterval(poll, 3000); refreshMedia();
 </script>
 </body>
 </html>

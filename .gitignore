@@ -8,3 +8,5 @@ portal/server.log
 portal/nohup.out
 
 .DS_Store
+portal/media/
+portal/media.json

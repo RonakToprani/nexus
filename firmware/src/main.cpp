@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include "config.h"
 #include "display.hpp"
 #include "anims.hpp"
@@ -120,65 +121,135 @@ static void pollTask(void*) {
   }
 }
 
-// ------------------------------------------------------------ custom image
+// ------------------------------------------------------------ custom media
+// /api/image.bin: "NX01" kind:u8 frames:u8 delay:u16 w:u16 h:u16, RGB565-LE.
+// Stills (320x240) stream straight to the panel. GIF packs (160x120 frames)
+// are saved once to LittleFS, then played locally with 2x pixel doubling.
 
-// Stream /api/image.bin (native RGB565) row-by-row straight to the panel.
-static bool drawCustomImage() {
+static const char* GIF_PATH = "/gif.bin";
+static int mKind = -1, mFrames = 0, mDelay = 100, mW = 0, mH = 0;
+static int gifIdx = 0;
+static uint32_t loadedRev = 0xFFFFFFFF;
+static uint32_t lastFrameAt = 0;
+static uint8_t* frameBuf = nullptr;   // one 160x120 GIF frame (38.4 KB)
+
+// panel is BGR-wired and raw pushImage bypasses LGFX color conversion:
+// swap R/B on the standard RGB565 the server sends
+static inline void swapRB(uint16_t* px, int n) {
+  for (int i = 0; i < n; i++) {
+    uint16_t v = px[i];
+    px[i] = (uint16_t)(((v & 0x001F) << 11) | (v & 0x07E0) | ((v & 0xF800) >> 11));
+  }
+}
+
+static bool readFull(WiFiClient* s, uint8_t* dst, size_t need) {
+  size_t got = 0;
+  while (got < need) {
+    size_t r = s->readBytes(dst + got, need - got);
+    if (r == 0) return false;
+    got += r;
+  }
+  return true;
+}
+
+static bool fetchMedia() {
   HTTPClient http;
   http.setConnectTimeout(3000);
-  http.setTimeout(8000);
+  http.setTimeout(15000);
   if (!http.begin(String(serverUrl) + "/api/image.bin")) return false;
-  int code = http.GET();
-  if (code != 200) { http.end(); return false; }
+  if (http.GET() != 200) { http.end(); return false; }
   WiFiClient* s = http.getStreamPtr();
-  s->setTimeout(4000);
-  static uint8_t row[320 * 2];
-  bool ok = true;
-  lcd.setSwapBytes(true);   // buffer is native little-endian; panel wants MSB first
-  lcd.startWrite();
-  for (int y = 0; y < lcd.height(); y++) {
-    size_t need = lcd.width() * 2, got = 0;
-    while (got < need) {
-      size_t r = s->readBytes(row + got, need - got);
-      if (r == 0) { ok = false; break; }
-      got += r;
-    }
-    if (!ok) break;
-    // panel is BGR-wired; raw pushImage bypasses LGFX color conversion,
-    // so swap the R/B channels of the standard RGB565 the server sends
-    uint16_t* px = (uint16_t*)row;
-    for (int x = 0; x < lcd.width(); x++) {
-      uint16_t v = px[x];
-      px[x] = (uint16_t)(((v & 0x001F) << 11) | (v & 0x07E0) | ((v & 0xF800) >> 11));
-    }
-    lcd.pushImage(0, y, lcd.width(), 1, px);
+  s->setTimeout(5000);
+  uint8_t hdr[12];
+  bool ok = readFull(s, hdr, 12) && memcmp(hdr, "NX01", 4) == 0;
+  if (ok) {
+    mKind = hdr[4]; mFrames = hdr[5];
+    mDelay = hdr[6] | (hdr[7] << 8);
+    mW = hdr[8] | (hdr[9] << 8);
+    mH = hdr[10] | (hdr[11] << 8);
+    if (mDelay < 30) mDelay = 100;
   }
-  lcd.endWrite();
+  static uint8_t row[320 * 2];
+  if (ok && mKind == 0 && mW == 320 && mH == 240) {   // still: straight to panel
+    lcd.setSwapBytes(true);
+    lcd.startWrite();
+    for (int y = 0; y < mH && ok; y++) {
+      ok = readFull(s, row, mW * 2);
+      if (ok) { swapRB((uint16_t*)row, mW); lcd.pushImage(0, y, mW, 1, (uint16_t*)row); }
+    }
+    lcd.endWrite();
+  } else if (ok && mKind == 1 && mW == 160 && mH == 120 && mFrames >= 1) {
+    File f = LittleFS.open(GIF_PATH, "w");   // gif: swap once while saving
+    ok = (bool)f;
+    size_t left = (size_t)mFrames * mW * mH * 2;
+    while (ok && left > 0) {
+      size_t chunk = left < sizeof(row) ? left : sizeof(row);
+      ok = readFull(s, row, chunk);
+      if (ok) {
+        swapRB((uint16_t*)row, chunk / 2);
+        ok = f.write(row, chunk) == chunk;
+        left -= chunk;
+      }
+    }
+    if (f) f.close();
+    gifIdx = 0;
+    Serial.printf("[media] gif %d frames, %d ms/frame, ok=%d\n", mFrames, mDelay, ok);
+  } else {
+    ok = false;
+  }
   http.end();
+  if (!ok) mKind = -1;
   return ok;
 }
 
-static bool customDirty = true;    // set on mode entry and when img_rev changes
+static void drawGifFrame() {
+  if (!frameBuf) frameBuf = (uint8_t*)malloc(160 * 120 * 2);
+  if (!frameBuf) return;
+  File f = LittleFS.open(GIF_PATH, "r");
+  if (!f) { mKind = -1; return; }
+  f.seek((size_t)gifIdx * 160 * 120 * 2);
+  size_t n = f.read(frameBuf, 160 * 120 * 2);
+  f.close();
+  if (n != 160 * 120 * 2) { mKind = -1; return; }
+  static uint16_t line[320];
+  lcd.setSwapBytes(true);
+  lcd.startWrite();
+  for (int y = 0; y < 120; y++) {
+    uint16_t* src = (uint16_t*)(frameBuf + y * 160 * 2);
+    for (int x = 0; x < 160; x++) { line[2 * x] = src[x]; line[2 * x + 1] = src[x]; }
+    lcd.pushImage(0, y * 2, 320, 1, line);
+    lcd.pushImage(0, y * 2 + 1, 320, 1, line);
+  }
+  lcd.endWrite();
+  gifIdx = (gifIdx + 1) % mFrames;
+}
 
-static void customImageMode() {
-  static uint32_t shownRev = 0;
-  if (vImgRev != shownRev) customDirty = true;
-  if (customDirty) {
-    if (drawCustomImage()) {
-      shownRev = vImgRev;
-      customDirty = false;
+static void customEnter() {
+  // resume a cached GIF without re-downloading; anything else refetches
+  if (!(mKind == 1 && loadedRev == vImgRev)) loadedRev = 0xFFFFFFFF;
+}
+
+static void customMediaMode() {
+  if (vImgRev != loadedRev) {
+    if (fetchMedia()) {
+      loadedRev = vImgRev;
     } else {
       lcd.fillScreen(TFT_BLACK);
       lcd.setFont(&fonts::Font2);
       lcd.setTextDatum(lgfx::middle_center);
       lcd.setTextColor(0x07FF);
-      lcd.drawString("NO IMAGE YET", lcd.width() / 2, lcd.height() / 2 - 10);
+      lcd.drawString("NO MEDIA YET", lcd.width() / 2, lcd.height() / 2 - 10);
       lcd.setTextColor(0xFFFF);
-      lcd.drawString("Upload one from the portal", lcd.width() / 2, lcd.height() / 2 + 14);
-      delay(3000);   // stay dirty: retry on the next pass
+      lcd.drawString("Upload from the portal", lcd.width() / 2, lcd.height() / 2 + 14);
+      delay(3000);   // retry on the next pass
+      return;
     }
   }
-  delay(80);
+  if (mKind == 1 && millis() - lastFrameAt >= (uint32_t)mDelay) {
+    lastFrameAt = millis();
+    drawGifFrame();
+  }
+  delay(mKind == 1 ? 4 : 60);
 }
 
 // ------------------------------------------------------------ setup / loop
@@ -198,6 +269,7 @@ void setup() {
   lcd.setBrightness(220);
   bootMsg("Linking WiFi...", nullptr, nullptr, nullptr);
 
+  LittleFS.begin(true);   // GIF frame cache; formats on first use
   prefs.begin("nexus");
   String saved = prefs.getString("url", DEFAULT_SERVER_URL);
   strlcpy(serverUrl, saved.c_str(), sizeof(serverUrl));
@@ -256,7 +328,7 @@ void loop() {
 
   if (vAnim != curAnim) {
     curAnim = vAnim;
-    if (curAnim == ANIM_COUNT) customDirty = true;   // entering custom image mode
+    if (curAnim == ANIM_COUNT) customEnter();   // entering custom media mode
     else ANIMS[curAnim].begin(spr);
   }
   if (vBright != curBright) {
@@ -271,7 +343,7 @@ void loop() {
   }
 
   if (curAnim == ANIM_COUNT) {
-    customImageMode();
+    customMediaMode();
     return;
   }
 
