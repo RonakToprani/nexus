@@ -596,7 +596,9 @@ async function buildStill(f) {
   let img;
   try { img = await createImageBitmap(f); }
   catch (_) { throw new Error('browser cannot decode this format (HEIC?) - use PNG/JPG/GIF'); }
-  const c = new OffscreenCanvas(320, 240), x = c.getContext('2d');
+  const c = document.createElement('canvas');
+  c.width = 320; c.height = 240;
+  const x = c.getContext('2d');
   coverDraw(x, img, 320, 240);
   const out = new Uint8Array(12 + 320 * 240 * 2);
   out.set([0x4E, 0x58, 0x30, 0x31, 0, 1, 0, 0, 320 & 255, 320 >> 8, 240, 0]);
@@ -604,25 +606,190 @@ async function buildStill(f) {
   return out;
 }
 
-async function buildGif(f) {
-  if (!('ImageDecoder' in window)) throw new Error('GIF decoding needs Chrome/Edge');
+const MAXF = 20;
+
+function packGifOut(n, delay) {
+  const out = new Uint8Array(12 + n * 160 * 120 * 2);
+  delay = Math.round(Math.min(500, Math.max(30, delay || 100)));
+  out.set([0x4E, 0x58, 0x30, 0x31, 1, n, delay & 255, delay >> 8, 160, 0, 120, 0]);
+  return out;
+}
+
+async function buildGifNative(f) {   // Chrome/Edge fast path
   const dec = new ImageDecoder({data: await f.arrayBuffer(), type: 'image/gif'});
   await dec.tracks.ready; await dec.completed;
   const total = dec.tracks.selectedTrack.frameCount;
-  const MAXF = 20, n = Math.min(total, MAXF);
+  const n = Math.min(total, MAXF);
   const c = new OffscreenCanvas(160, 120), x = c.getContext('2d');
-  const out = new Uint8Array(12 + n * 160 * 120 * 2);
-  let delay = 100;
+  let out = null, delay = 100;
   for (let k = 0; k < n; k++) {
     const idx = total <= MAXF ? k : Math.floor(k * total / n);   // sample long GIFs
     const {image} = await dec.decode({frameIndex: idx});
-    if (k === 0 && image.duration) delay = Math.min(500, Math.max(30, image.duration / 1000));
+    if (k === 0) { delay = image.duration ? image.duration / 1000 : 100; out = packGifOut(n, delay); }
+    x.clearRect(0, 0, 160, 120);
     coverDraw(x, image, 160, 120);
     image.close();
     pack565(x.getImageData(0, 0, 160, 120).data, out, 12 + k * 160 * 120 * 2);
   }
-  out.set([0x4E, 0x58, 0x30, 0x31, 1, n, delay & 255, delay >> 8, 160, 0, 120, 0]);
   return out;
+}
+
+// ---- universal pure-JS GIF decoder (Safari/Firefox fallback) ----
+function gifLzw(minCodeSize, data, pixelCount) {
+  const pixels = new Uint8Array(pixelCount);
+  const clear = 1 << minCodeSize, eoi = clear + 1;
+  let available = clear + 2, oldCode = -1;
+  let codeSize = minCodeSize + 1, codeMask = (1 << codeSize) - 1;
+  const prefix = new Int32Array(4096), suffix = new Uint8Array(4096),
+        stack = new Uint8Array(4097);
+  for (let c = 0; c < clear; c++) suffix[c] = c;
+  let datum = 0, bits = 0, first = 0, top = 0, bi = 0;
+  for (let i = 0; i < pixelCount;) {
+    if (top === 0) {
+      if (bits < codeSize) {
+        if (bi >= data.length) break;
+        datum += data[bi++] << bits; bits += 8;
+        continue;
+      }
+      let code = datum & codeMask;
+      datum >>= codeSize; bits -= codeSize;
+      if (code > available || code === eoi) break;
+      if (code === clear) {
+        codeSize = minCodeSize + 1; codeMask = (1 << codeSize) - 1;
+        available = clear + 2; oldCode = -1;
+        continue;
+      }
+      if (oldCode === -1) { stack[top++] = suffix[code]; oldCode = code; first = code; continue; }
+      const inCode = code;
+      if (code === available) { stack[top++] = first; code = oldCode; }
+      while (code > clear) { stack[top++] = suffix[code]; code = prefix[code]; }
+      first = suffix[code];
+      stack[top++] = first;
+      if (available < 4096) {
+        prefix[available] = oldCode; suffix[available] = first;
+        if ((++available & codeMask) === 0 && available < 4096) { codeSize++; codeMask += available; }
+      }
+      oldCode = inCode;
+    }
+    pixels[i++] = stack[--top];
+  }
+  return pixels;
+}
+
+function gifWalk(u8, onFrame) {   // walk blocks; onFrame(p at image descriptor) -> new p
+  let p = 10;
+  const gctFlag = u8[p] & 0x80, gctSize = 3 * (2 << (u8[p] & 7));
+  p = 13 + (gctFlag ? gctSize : 0);
+  let meta = {delay: 100, transp: -1, disposal: 0};
+  while (p < u8.length) {
+    const b = u8[p++];
+    if (b === 0x3B || b === undefined) break;
+    if (b === 0x21) {
+      const label = u8[p++];
+      if (label === 0xF9) {
+        const flags = u8[p + 1];
+        meta.delay = ((u8[p + 2] | (u8[p + 3] << 8)) * 10) || 100;
+        meta.transp = (flags & 1) ? u8[p + 4] : -1;
+        meta.disposal = (flags >> 2) & 7;
+      }
+      let s; while ((s = u8[p++]) !== 0) p += s;   // skip sub-blocks
+    } else if (b === 0x2C) {
+      p = onFrame(p, meta);
+      meta = {delay: meta.delay, transp: -1, disposal: 0};
+    } else break;
+  }
+}
+
+function skipFrame(u8, p) {   // past descriptor + local table + data blocks
+  const lf = u8[p + 8];
+  p += 9 + ((lf & 0x80) ? 3 * (2 << (lf & 7)) : 0) + 1;
+  let s; while ((s = u8[p++]) !== 0) p += s;
+  return p;
+}
+
+async function buildGifJS(f) {
+  const u8 = new Uint8Array(await f.arrayBuffer());
+  if (String.fromCharCode(u8[0], u8[1], u8[2]) !== 'GIF') throw new Error('not a GIF file');
+  const W = u8[6] | (u8[7] << 8), H = u8[8] | (u8[9] << 8);
+  const gct = (u8[10] & 0x80) ? u8.subarray(13, 13 + 3 * (2 << (u8[10] & 7))) : null;
+  let total = 0;
+  gifWalk(u8, p => { total++; return skipFrame(u8, p); });
+  if (!total) throw new Error('no frames found');
+  const n = Math.min(total, MAXF);
+  const keep = new Set();
+  for (let k = 0; k < n; k++) keep.add(total <= MAXF ? k : Math.floor(k * total / n));
+  const canvas = new Uint8ClampedArray(W * H * 4);
+  let prevSnap = null, fi = 0, kept = 0, out = null, delaySum = 0;
+  const tmp = document.createElement('canvas'); tmp.width = W; tmp.height = H;
+  const tx = tmp.getContext('2d');
+  const oc = document.createElement('canvas'); oc.width = 160; oc.height = 120;
+  const ox = oc.getContext('2d');
+  gifWalk(u8, (p, meta) => {
+    const ix = u8[p] | (u8[p+1] << 8), iy = u8[p+2] | (u8[p+3] << 8);
+    const iw = u8[p+4] | (u8[p+5] << 8), ih = u8[p+6] | (u8[p+7] << 8);
+    const lf = u8[p+8];
+    p += 9;
+    let ct = gct;
+    if (lf & 0x80) { ct = u8.subarray(p, p + 3 * (2 << (lf & 7))); p += 3 * (2 << (lf & 7)); }
+    const interlaced = !!(lf & 0x40);
+    const minCode = u8[p++];
+    let s, len = 0, q = p;
+    while ((s = u8[q++]) !== 0) { len += s; q += s; }
+    const data = new Uint8Array(len);
+    let o = 0;
+    while ((s = u8[p++]) !== 0) { data.set(u8.subarray(p, p + s), o); o += s; p += s; }
+    if (!ct) { fi++; return p; }
+    const idxs = gifLzw(minCode, data, iw * ih);
+    if (meta.disposal === 3) prevSnap = canvas.slice();
+    let rows = null;
+    if (interlaced) {
+      rows = [];
+      for (const [st, step] of [[0,8],[4,8],[2,4],[1,2]])
+        for (let y = st; y < ih; y += step) rows.push(y);
+    }
+    let ri = 0;
+    for (let yy = 0; yy < ih; yy++) {
+      const y = iy + (rows ? rows[yy] : yy);
+      for (let xx = 0; xx < iw; xx++, ri++) {
+        const ci = idxs[ri];
+        if (ci === meta.transp) continue;
+        const x2 = ix + xx;
+        if (x2 >= W || y >= H) continue;
+        const d = (y * W + x2) * 4;
+        canvas[d] = ct[ci*3]; canvas[d+1] = ct[ci*3+1]; canvas[d+2] = ct[ci*3+2]; canvas[d+3] = 255;
+      }
+    }
+    if (keep.has(fi)) {
+      tx.putImageData(new ImageData(canvas.slice(), W, H), 0, 0);
+      ox.clearRect(0, 0, 160, 120);
+      coverDraw(ox, tmp, 160, 120);
+      if (!out) out = packGifOut(n, 100);
+      pack565(ox.getImageData(0, 0, 160, 120).data, out, 12 + kept * 160 * 120 * 2);
+      kept++; delaySum += meta.delay;
+    }
+    if (meta.disposal === 2) {   // restore to background: clear frame rect
+      for (let yy = 0; yy < ih; yy++) for (let xx = 0; xx < iw; xx++) {
+        const x2 = ix + xx, y = iy + yy;
+        if (x2 >= W || y >= H) continue;
+        const d = (y * W + x2) * 4;
+        canvas[d] = canvas[d+1] = canvas[d+2] = canvas[d+3] = 0;
+      }
+    } else if (meta.disposal === 3 && prevSnap) canvas.set(prevSnap);
+    fi++;
+    return p;
+  });
+  if (!kept) throw new Error('could not decode frames');
+  out[5] = kept;   // actual kept frame count
+  const d = Math.round(delaySum / kept);
+  out[6] = Math.min(500, Math.max(30, d)) & 255; out[7] = Math.min(500, Math.max(30, d)) >> 8;
+  return out.subarray(0, 12 + kept * 160 * 120 * 2);
+}
+
+async function buildGif(f) {
+  if ('ImageDecoder' in window) {
+    try { return await buildGifNative(f); } catch (_) { /* fall through to JS decoder */ }
+  }
+  return await buildGifJS(f);
 }
 
 document.getElementById('file').onchange = async e => {
