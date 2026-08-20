@@ -144,7 +144,14 @@ static bool drawCustomImage() {
       got += r;
     }
     if (!ok) break;
-    lcd.pushImage(0, y, lcd.width(), 1, (uint16_t*)row);
+    // panel is BGR-wired; raw pushImage bypasses LGFX color conversion,
+    // so swap the R/B channels of the standard RGB565 the server sends
+    uint16_t* px = (uint16_t*)row;
+    for (int x = 0; x < lcd.width(); x++) {
+      uint16_t v = px[x];
+      px[x] = (uint16_t)(((v & 0x001F) << 11) | (v & 0x07E0) | ((v & 0xF800) >> 11));
+    }
+    lcd.pushImage(0, y, lcd.width(), 1, px);
   }
   lcd.endWrite();
   http.end();
