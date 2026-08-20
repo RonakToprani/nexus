@@ -462,7 +462,12 @@ document.getElementById('file').onchange = async e => {
   const st = document.getElementById('upStatus');
   st.textContent = 'PROCESSING...';
   try {
-    const img = await createImageBitmap(f);
+    let img;
+    try {
+      img = await createImageBitmap(f);
+    } catch (_) {
+      throw new Error('browser cannot decode this format (HEIC?) - use PNG or JPG');
+    }
     const c = document.createElement('canvas');
     c.width = 320; c.height = 240;
     const x = c.getContext('2d');
