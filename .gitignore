@@ -1,0 +1,10 @@
+# PlatformIO build output
+firmware/.pio/
+
+# portal runtime state (created on the machine running the server)
+portal/state.json
+portal/image.bin
+portal/server.log
+portal/nohup.out
+
+.DS_Store
