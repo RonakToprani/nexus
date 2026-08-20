@@ -134,7 +134,7 @@ static bool drawCustomImage() {
   s->setTimeout(4000);
   static uint8_t row[320 * 2];
   bool ok = true;
-  lcd.setSwapBytes(false);
+  lcd.setSwapBytes(true);   // buffer is native little-endian; panel wants MSB first
   lcd.startWrite();
   for (int y = 0; y < lcd.height(); y++) {
     size_t need = lcd.width() * 2, got = 0;
