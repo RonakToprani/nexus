@@ -11,6 +11,10 @@ NEW=$(git rev-parse HEAD)
 
 if [ "$OLD" != "$NEW" ]; then
     echo "updated $OLD -> $NEW, restarting portal"
-    systemctl restart nexus-portal 2>/dev/null \
-        || sudo systemctl restart nexus-portal
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart nexus-portal 2>/dev/null \
+            || sudo systemctl restart nexus-portal
+    else  # macOS
+        launchctl kickstart -k "gui/$(id -u)/com.nexus.portal"
+    fi
 fi
